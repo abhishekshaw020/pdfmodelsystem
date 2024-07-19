@@ -1,162 +1,131 @@
-import logging
+from flask import Flask, request, render_template, redirect, url_for, session
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from PyPDF2 import PdfReader
 import os
-
-from cachetools import Cache
-import pdfplumber
 import requests
 from bs4 import BeautifulSoup
-from celery import Celery
-from flask import Flask, request, jsonify, render_template
-from flask_caching import Cache
-from transformers import pipeline
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = '26484ddbbd45f1e5fada62fb3f1ece92'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///db.sqlite'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB limit
-app.config['CELERY_BROKER_URL'] = 'redis://localhost:6379/0'
-app.config['CELERY_RESULT_BACKEND'] = 'redis://localhost:6379/0'
-app.config['CACHE_TYPE'] = 'simple'
 
-cache = Cache(app)
-celery = Celery(app.name, broker=app.config['CELERY_BROKER_URL'])
-celery.conf.update(app.config)
+db = SQLAlchemy(app)
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
 
-# Ensure the upload folder exists
-if not os.path.exists(app.config['UPLOAD_FOLDER']):
-    os.makedirs(app.config['UPLOAD_FOLDER'])
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(100), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128))
 
-# Initialize the question-answering pipeline with an explicit model
-try:
-    qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad")
-except Exception as e:
-    logging.error(f"Error initializing QA pipeline: {e}")
-    qa_pipeline = None
+    @property
+    def password(self):
+        raise AttributeError('password is not a readable attribute')
 
+    @password.setter
+    def password(self, password):
+        self.password_hash = generate_password_hash(password)
 
-@celery.task
-def extract_text_from_pdf_task(pdf_file_path):
-    text = ""
-    try:
-        with pdfplumber.open(pdf_file_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text
-    except Exception as e:
-        logging.error(f"Error extracting text from PDF: {e}")
-        return None
-    return text
+    def verify_password(self, password):
+        return check_password_hash(self.password_hash, password)
 
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
 
 @app.route('/')
-def home():
-    return render_template('index.html')
+def index():
+    return 'Welcome! Please <a href="/login">login</a> or <a href="/register">register</a>.'
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        user = User.query.filter_by(username=username).first()
+        if user and user.verify_password(password):
+            login_user(user)
+            return redirect(url_for('upload_pdf'))
+        return 'Invalid username or password'
+    return render_template('login.html')
 
-@app.route('/upload', methods=['POST'])
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        if User.query.filter_by(username=username).first():
+            return 'Username already exists'
+        new_user = User(username=username, password=password)
+        db.session.add(new_user)
+        db.session.commit()
+        return redirect(url_for('login'))
+    return render_template('register.html')
+
+@app.route('/upload', methods=['GET', 'POST'])
+@login_required
 def upload_pdf():
-    try:
-        if 'pdf' not in request.files:
-            return jsonify({"error": "No file part"}), 400
-        file = request.files['pdf']
-        if file.filename == '':
-            return jsonify({"error": "No selected file"}), 400
+    if request.method == 'POST':
+        file = request.files['file']
         if file and file.filename.endswith('.pdf'):
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-            file.save(file_path)
-            task = extract_text_from_pdf_task.delay(file_path)
-            return jsonify({"task_id": task.id}), 202
-        else:
-            return jsonify({"error": "Invalid file type"}), 400
-    except Exception as e:
-        logging.error(f"Error during file upload: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+            filename = secure_filename(file.filename)
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+            text = extract_text_from_pdf(filepath)
+            session['pdf_text'] = text
+            return redirect(url_for('ask_question'))
+    return render_template('upload.html')
 
+def extract_text_from_pdf(filepath):
+    reader = PdfReader(filepath)
+    text = ''
+    for page in reader.pages:
+        text += page.extract_text() or ' '
+    return text
 
-@app.route('/task_status/<task_id>', methods=['GET'])
-def task_status(task_id):
-    task = extract_text_from_pdf_task.AsyncResult(task_id)
-    if task.state == 'PENDING':
-        response = {
-            'state': task.state,
-            'current': 0,
-            'total': 1,
-            'status': 'Pending...'
-        }
-    elif task.state != 'FAILURE':
-        response = {
-            'state': task.state,
-            'current': 1,
-            'total': 1,
-            'status': 'Completed!',
-            'result': task.result
-        }
-    else:
-        response = {
-            'state': task.state,
-            'current': 1,
-            'total': 1,
-            'status': str(task.info),
-        }
-    return jsonify(response)
-
-
-@app.route('/ask', methods=['POST'])
+@app.route('/ask_question', methods=['GET', 'POST'])
+@login_required
 def ask_question():
-    if qa_pipeline is None:
-        return jsonify({"error": "QA pipeline not available"}), 500
-    try:
-        data = request.json
-        question = data.get('question', '')
-        text = data.get('text', '')
+    if request.method == 'POST':
+        question = request.form['question']
+        pdf_text = session.get('pdf_text', '')
+        answer = search_text(pdf_text, question)
+        if not answer:
+            answer = search_internet(question)
+        return render_template('answer.html', question=question, answer=answer)
+    return render_template('ask_question.html')
 
-        if not question or not text:
-            return jsonify({"error": "Invalid input"}), 400
-
-        # Answer from PDF content
-        answer = qa_pipeline(question=question, context=text)
-        if answer['score'] > 0.1:  # If confidence is sufficient
-            return jsonify({"answer": answer['answer']})
-
-        # Fallback to internet search
-        search_results = search_internet(question)
-        return jsonify({"answer": "Information not found in the PDF. Here are some web search results.",
-                        "search_results": search_results})
-    except Exception as e:
-        logging.error(f"Error during question answering: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-
+def search_text(text, query):
+    # This is a simple implementation; for more complex searches, consider using regex or NLP libraries
+    if query.lower() in text.lower():
+        return "Answer found in PDF: " + query
+    return None
 
 def search_internet(query):
-    search_url = f"https://www.google.com/search?q={query}"
+    url = 'https://html.duckduckgo.com/html/'
+    params = {'q': query}
     headers = {'User-Agent': 'Mozilla/5.0'}
-    response = requests.get(search_url, headers=headers)
-    soup = BeautifulSoup(response.text, 'html.parser')
-    results = []
-    for g in soup.find_all('div', class_='tF2Cxc'):
-        title = g.find('h3').text
-        link = g.find('a')['href']
-        snippet = g.find('span').text
-        results.append({"title": title, "link": link, "snippet": snippet})
-    return results
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.text, 'html.parser')
+        snippets = soup.find_all('a', class_='result__snippet')
+        if snippets:
+            return ' '.join([snippet.get_text() for snippet in snippets[:5]])  # Return the first 5 results
+    return 'No results found on the internet.'
 
-
-@app.errorhandler(413)
-def request_entity_too_large(error):
-    return jsonify({"error": "File too large"}), 413
-
-
-@app.errorhandler(404)
-def page_not_found(error):
-    return jsonify({"error": "Page not found"}), 404
-
-
-@app.errorhandler(500)
-def internal_server_error(error):
-    return jsonify({"error": "Internal server error"}), 500
-
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    # Set up logging to output to the console
-    logging.basicConfig(level=logging.DEBUG)
-    app.run(debug=False)
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
