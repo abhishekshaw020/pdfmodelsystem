@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+
+{% block title %}Answer{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <h2 class="mb-3">Question: {{ question }}</h2>
+        <p>{{ answer }}</p>
+    </div>
+</div>
+{% endblock %}
