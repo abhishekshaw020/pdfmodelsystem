@@ -1,8 +1,6 @@
 Flask
-Flask-Caching
-pdfplumber
-requests
-beautifulsoup4
-celery
-transformers
-redis
+Flask-Login
+Flask-SQLAlchemy
+PyPDF2
+Werkzeug
+gunicorn
